@@ -138,12 +138,19 @@ function send(ws, payload) {
   if (!ws) return false;
 
   if (ws.readyState !== WebSocket.OPEN) {
+    console.log(
+      `[send] socket#${ws.sid} NOT OPEN state=${ws.readyState}`
+    );
     return false;
   }
 
   const output = frames(payload);
 
   for (const frame of output) {
+    console.log(
+      `[send] socket#${ws.sid} -> ${frame}`
+    );
+
     ws.send(frame);
   }
 
