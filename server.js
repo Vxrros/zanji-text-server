@@ -1,22 +1,15 @@
-// Zanji Text Server v7
-// Backend server for the MicroStudio Zanji mobile game.
-//
-// Required Render environment variable:
-// DATABASE_URL
-//
-// Optional:
-// PORT
-// REPLY_FORMAT = raw | envelope | both
-//
-// NOTE:
-// The actual game remains MicroStudio/MicroScript.
-// This file is ONLY the online server.
+// =====================================================
+// ZANJI TEXT SERVER
+// MicroStudio external WebSocket server
+// Render + Supabase
+// =====================================================
 
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const postgres = require("postgres");
 
+const PORT = process.env.PORT || 10000;
 const DATABASE_URL = process.env.DATABASE_URL;
 
 if (!DATABASE_URL) {
@@ -24,14 +17,9 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-const REPLY_FORMAT = (
-  process.env.REPLY_FORMAT || "raw"
-).toLowerCase();
-
-const ENVELOPE_NAME =
-  process.env.ENVELOPE_NAME || "mp_server_message";
-
-const NUMBER_RE = /^73\d{6}$/;
+// -----------------------------------------------------
+// Database
+// -----------------------------------------------------
 
 const sql = postgres(DATABASE_URL, {
   ssl: "require",
@@ -39,19 +27,30 @@ const sql = postgres(DATABASE_URL, {
   max: 5
 });
 
+// -----------------------------------------------------
+// HTTP / WebSocket
+// -----------------------------------------------------
+
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
 
-// Zanji number -> Set of connected sockets
+const wss = new WebSocket.Server({
+  server
+});
+
+// -----------------------------------------------------
+// Online users
+//
+// number -> Set of sockets
+// -----------------------------------------------------
+
 const online = new Map();
 
 let nextSocketId = 1;
 
-
-// ============================================================
-// HTTP
-// ============================================================
+// -----------------------------------------------------
+// Health
+// -----------------------------------------------------
 
 app.get("/", (req, res) => {
   res.send("Zanji Text Server is online!");
@@ -64,13 +63,11 @@ app.get("/health", (req, res) => {
   });
 });
 
-
-// ============================================================
-// DATABASE SETUP
-// ============================================================
+// -----------------------------------------------------
+// Database setup
+// -----------------------------------------------------
 
 async function setupDatabase() {
-  // Users / Zanji numbers
   await sql`
     CREATE TABLE IF NOT EXISTS zanji_users (
       number TEXT PRIMARY KEY,
@@ -79,7 +76,6 @@ async function setupDatabase() {
     )
   `;
 
-  // Messages
   await sql`
     CREATE TABLE IF NOT EXISTS messages (
       id BIGSERIAL PRIMARY KEY,
@@ -91,13 +87,11 @@ async function setupDatabase() {
     )
   `;
 
-  // Add this column if the table already existed
   await sql`
     ALTER TABLE messages
     ADD COLUMN IF NOT EXISTS client_msg_id TEXT
   `;
 
-  // Prevent duplicate client message IDs
   await sql`
     CREATE UNIQUE INDEX IF NOT EXISTS
     messages_from_client_msg_id_unique
@@ -108,67 +102,90 @@ async function setupDatabase() {
   console.log("Database ready!");
 }
 
+// -----------------------------------------------------
+// MicroStudio protocol
+//
+// MicroStudio exported servers send:
+//
+// {
+//   name: "mp_server_message",
+//   data: {...}
+// }
+//
+// Client messages arrive as:
+//
+// {
+//   name: "mp_client_message",
+//   data: {...}
+// }
+// -----------------------------------------------------
 
-// ============================================================
-// MICROSTUDIO MESSAGE FORMAT
-// ============================================================
-
-function frames(payload) {
-  const raw = JSON.stringify(payload);
-
-  const envelope = JSON.stringify({
-    name: ENVELOPE_NAME,
-    data: payload
-  });
-
-  if (REPLY_FORMAT === "both") {
-    return [raw, envelope];
-  }
-
-  if (REPLY_FORMAT === "envelope") {
-    return [envelope];
-  }
-
-  // Default: raw
-  return [raw];
-}
-
-
-function send(ws, payload) {
+function sendMicroStudio(ws, data) {
   if (!ws) return false;
 
   if (ws.readyState !== WebSocket.OPEN) {
     console.log(
-      `[send] socket#${ws.sid} NOT OPEN state=${ws.readyState}`
+      `[send] socket#${ws.sid} not open (${ws.readyState})`
     );
     return false;
   }
 
-  const output = frames(payload);
+  const packet = {
+    name: "mp_server_message",
+    data: data
+  };
 
-  for (const frame of output) {
-    console.log(
-      `[send] socket#${ws.sid} -> ${frame}`
+  const text = JSON.stringify(packet);
+
+  console.log(`[send] socket#${ws.sid} -> ${text}`);
+
+  try {
+    ws.send(text);
+    return true;
+  } catch (err) {
+    console.error(
+      `[send] socket#${ws.sid} failed:`,
+      err
     );
-
-    ws.send(frame);
+    return false;
   }
-
-  return true;
 }
 
+// -----------------------------------------------------
+// Online helpers
+// -----------------------------------------------------
 
-function sendToNumber(number, payload) {
+function addOnline(number, ws) {
+  if (!online.has(number)) {
+    online.set(number, new Set());
+  }
+
+  online.get(number).add(ws);
+}
+
+function removeOnline(number, ws) {
+  if (!number) return;
+
   const sockets = online.get(number);
 
-  if (!sockets) {
-    return 0;
+  if (!sockets) return;
+
+  sockets.delete(ws);
+
+  if (sockets.size === 0) {
+    online.delete(number);
   }
+}
+
+function sendToNumber(number, data) {
+  const sockets = online.get(number);
+
+  if (!sockets) return 0;
 
   let sent = 0;
 
   for (const ws of sockets) {
-    if (send(ws, payload)) {
+    if (sendMicroStudio(ws, data)) {
       sent++;
     }
   }
@@ -176,239 +193,200 @@ function sendToNumber(number, payload) {
   return sent;
 }
 
+// -----------------------------------------------------
+// Zanji numbers
+// -----------------------------------------------------
 
-// ============================================================
-// MICROSTUDIO PROTOCOL
-// ============================================================
-
-function unwrap(raw) {
-
-  // MicroStudio client message
-  if (
-    raw &&
-    raw.name === "mp_client_message" &&
-    raw.data !== undefined
-  ) {
-    return {
-      kind: "message",
-      payload: raw.data
-    };
-  }
-
-  // MicroStudio connection event
-  if (
-    raw &&
-    raw.name === "mp_client_connection"
-  ) {
-    return {
-      kind: "connection"
-    };
-  }
-
-  // Other MicroStudio event
-  if (
-    raw &&
-    raw.name
-  ) {
-    return {
-      kind: "other:" + raw.name
-    };
-  }
-
-  // Direct/raw application message
-  if (
-    raw &&
-    raw.type
-  ) {
-    return {
-      kind: "message",
-      payload: raw
-    };
-  }
-
-  return {
-    kind: "unknown"
-  };
+function validNumber(number) {
+  return /^73\d{6}$/.test(number);
 }
 
-
-// ============================================================
-// ZANJI NUMBERS
-// ============================================================
-
-async function newNumber() {
-
-  for (let i = 0; i < 50; i++) {
-
+async function generateNumber() {
+  for (let attempt = 0; attempt < 100; attempt++) {
     const number =
       "73" +
       String(
-        Math.floor(
-          100000 + Math.random() * 900000
-        )
+        Math.floor(Math.random() * 900000) + 100000
       );
 
-    const rows = await sql`
-      SELECT 1
+    const existing = await sql`
+      SELECT number
       FROM zanji_users
       WHERE number = ${number}
+      LIMIT 1
     `;
 
-    if (rows.length === 0) {
+    if (existing.length === 0) {
       return number;
     }
   }
 
-  throw new Error("Could not find a free Zanji number");
+  throw new Error("Could not generate a Zanji number.");
 }
 
+// -----------------------------------------------------
+// Register
+// -----------------------------------------------------
 
-// ============================================================
-// REGISTER
-// ============================================================
+async function register(ws, data) {
+  let requestedNumber = String(data.number || "");
+  let token = String(data.token || "");
 
-async function handleRegister(ws, payload) {
-
-  let number = String(payload.number || "");
-  const token = String(payload.token || "");
-
-  // If the client did not provide a valid number,
-  // give it a new one.
-  if (!NUMBER_RE.test(number)) {
-    number = await newNumber();
+  if (!token) {
+    token =
+      "t" +
+      Math.floor(Math.random() * 1000000000) +
+      "x" +
+      Math.floor(Math.random() * 1000000000);
   }
 
-  let rows = await sql`
-    SELECT token
+  let number = requestedNumber;
+
+  // New / invalid number
+  if (!validNumber(number)) {
+    number = await generateNumber();
+  }
+
+  // Check existing owner
+  const existing = await sql`
+    SELECT number, token
     FROM zanji_users
     WHERE number = ${number}
+    LIMIT 1
   `;
 
-  // New account
-  if (rows.length === 0) {
+  if (existing.length > 0) {
+    // Correct token = returning owner
+    if (existing[0].token !== token) {
+      console.log(
+        `[reg] ${number} belongs to another token`
+      );
 
+      number = await generateNumber();
+    }
+  } else {
     await sql`
-      INSERT INTO zanji_users
-        (number, token)
-      VALUES
-        (${number}, ${token})
-      ON CONFLICT DO NOTHING
-    `;
-
-    rows = await sql`
-      SELECT token
-      FROM zanji_users
-      WHERE number = ${number}
+      INSERT INTO zanji_users (number, token)
+      VALUES (${number}, ${token})
     `;
   }
 
-  // If the number belongs to another token,
-  // issue a new number.
-  if (
-    rows.length > 0 &&
-    rows[0].token !== token
-  ) {
+  // Save token if this number was newly assigned
+  await sql`
+    INSERT INTO zanji_users (number, token)
+    VALUES (${number}, ${token})
+    ON CONFLICT (number)
+    DO UPDATE SET token = zanji_users.token
+  `;
 
-    number = await newNumber();
+  // ---------------------------------------------------
+  // Replace stale sockets for this number
+  // ---------------------------------------------------
 
-    await sql`
-      INSERT INTO zanji_users
-        (number, token)
-      VALUES
-        (${number}, ${token})
-    `;
+  const oldSockets = online.get(number);
 
-    console.log(
-      `[reg] number conflict, issued new number ${number}`
-    );
+  if (oldSockets) {
+    for (const old of oldSockets) {
+      if (old !== ws) {
+        console.log(
+          `[reg] closing stale socket#${old.sid} for ${number}`
+        );
+
+        old.zanjiNumber = null;
+
+        try {
+          old.close(4001, "Replaced by newer connection");
+        } catch (err) {}
+      }
+    }
+
+    online.delete(number);
   }
 
-  // Remove this socket from its previous number.
-  if (
-    ws.zanji &&
-    ws.zanji !== number
-  ) {
-    detach(ws);
-  }
+  ws.zanjiNumber = number;
+  ws.zanjiToken = token;
 
-  ws.zanji = number;
-
-  if (!online.has(number)) {
-    online.set(number, new Set());
-  }
-
-  online.get(number).add(ws);
+  addOnline(number, ws);
 
   console.log(
-    `[reg] ${number} socket#${ws.sid} ` +
-    `online=${online.get(number).size}`
+    `[reg] ${number} socket#${ws.sid} online`
   );
 
-  // Tell the client its number.
-  send(ws, {
+  console.log(
+    `[reg] online numbers:`,
+    [...online.keys()]
+  );
+
+  // ---------------------------------------------------
+  // IMPORTANT:
+  // Send ONLY through the MicroStudio protocol.
+  // ---------------------------------------------------
+
+  sendMicroStudio(ws, {
     type: "assigned",
     number: number
   });
 
-  // Tell the client it is online.
-  send(ws, {
+  sendMicroStudio(ws, {
     type: "status",
     text: "ONLINE"
   });
 
-  // Deliver saved offline messages.
   await deliverPending(number, ws);
 }
 
-
-// ============================================================
-// DELIVER SAVED MESSAGES
-// ============================================================
+// -----------------------------------------------------
+// Pending messages
+// -----------------------------------------------------
 
 async function deliverPending(number, ws) {
-
-  const rows = await sql`
+  const messages = await sql`
     SELECT
       id,
       from_number,
       to_number,
       body
     FROM messages
-    WHERE
-      to_number = ${number}
+    WHERE to_number = ${number}
       AND delivered_at IS NULL
     ORDER BY id ASC
-    LIMIT 200
   `;
 
-  for (const message of rows) {
+  console.log(
+    `[pending] ${number}: ${messages.length} message(s)`
+  );
 
-    send(ws, {
+  for (const message of messages) {
+    const delivered = sendMicroStudio(ws, {
       type: "msg",
       id: String(message.id),
       from: message.from_number,
       to: message.to_number,
       body: message.body
     });
-  }
 
-  console.log(
-    `[pending] ${number}: pushed ${rows.length} message(s)`
-  );
+    if (delivered) {
+      await sql`
+        UPDATE messages
+        SET delivered_at = NOW()
+        WHERE id = ${message.id}
+          AND delivered_at IS NULL
+      `;
+
+      console.log(
+        `[pending] delivered #${message.id} -> ${number}`
+      );
+    }
+  }
 }
 
+// -----------------------------------------------------
+// Send message
+// -----------------------------------------------------
 
-// ============================================================
-// SEND MESSAGE
-// ============================================================
-
-async function handleSend(ws, payload) {
-
-  const from = ws.zanji;
-
-  if (!from) {
-
-    send(ws, {
+async function handleSend(ws, data) {
+  if (!ws.zanjiNumber) {
+    sendMicroStudio(ws, {
       type: "status",
       text: "Not registered yet."
     });
@@ -416,20 +394,11 @@ async function handleSend(ws, payload) {
     return;
   }
 
-  const dest = String(payload.dest || "");
+  const dest = String(data.dest || "");
+  const body = String(data.body || "");
 
-  const body = String(
-    payload.body || ""
-  ).slice(0, 1000);
-
-  const cid =
-    payload.cid
-      ? String(payload.cid)
-      : null;
-
-  if (!NUMBER_RE.test(dest)) {
-
-    send(ws, {
+  if (!validNumber(dest)) {
+    sendMicroStudio(ws, {
       type: "status",
       text: "That is not a Zanji number."
     });
@@ -438,8 +407,7 @@ async function handleSend(ws, payload) {
   }
 
   if (!body) {
-
-    send(ws, {
+    sendMicroStudio(ws, {
       type: "status",
       text: "Message was empty."
     });
@@ -447,378 +415,268 @@ async function handleSend(ws, payload) {
     return;
   }
 
+  // ---------------------------------------------------
+  // Save first.
+  //
+  // This guarantees offline messages survive
+  // Render restarts.
+  // ---------------------------------------------------
 
-  // Save message permanently.
   const inserted = await sql`
     INSERT INTO messages
-      (
-        from_number,
-        to_number,
-        body,
-        client_msg_id
-      )
+      (from_number, to_number, body)
     VALUES
-      (
-        ${from},
-        ${dest},
-        ${body},
-        ${cid}
-      )
-    ON CONFLICT
-      (from_number, client_msg_id)
-      WHERE client_msg_id IS NOT NULL
-    DO NOTHING
+      (${ws.zanjiNumber}, ${dest}, ${body})
     RETURNING id
   `;
 
+  const id = inserted[0].id;
 
-  let id;
+  console.log(
+    `[msg] ${ws.zanjiNumber} -> ${dest} #${id}`
+  );
 
+  // ---------------------------------------------------
+  // Try immediate delivery
+  // ---------------------------------------------------
 
-  // Duplicate message
-  if (inserted.length === 0) {
+  const sent = sendToNumber(dest, {
+    type: "msg",
+    id: String(id),
+    from: ws.zanjiNumber,
+    to: dest,
+    body: body
+  });
 
-    const existing = await sql`
-      SELECT id
-      FROM messages
-      WHERE
-        from_number = ${from}
-        AND client_msg_id = ${cid}
+  if (sent > 0) {
+    await sql`
+      UPDATE messages
+      SET delivered_at = NOW()
+      WHERE id = ${id}
+        AND delivered_at IS NULL
     `;
 
-    if (existing.length === 0) {
-      throw new Error(
-        "Could not find duplicate message"
-      );
-    }
-
-    id = existing[0].id;
-
     console.log(
-      `[send] duplicate ${from} -> ${dest} cid=${cid}`
+      `[msg] #${id} delivered immediately`
     );
 
-    send(ws, {
-      type: "sent",
-      cid: cid,
-      id: String(id),
-      online: online.has(dest)
+    sendMicroStudio(ws, {
+      type: "status",
+      text: "DELIVERED"
     });
+  } else {
+    console.log(
+      `[msg] #${id} saved for offline recipient ${dest}`
+    );
 
+    sendMicroStudio(ws, {
+      type: "status",
+      text: "SAVED - recipient is offline"
+    });
+  }
+}
+
+// -----------------------------------------------------
+// MicroStudio application message
+// -----------------------------------------------------
+
+async function handleApplicationMessage(ws, data) {
+  if (!data || typeof data !== "object") {
     return;
   }
 
+  console.log(
+    `[app] socket#${ws.sid}`,
+    data
+  );
 
-  id = inserted[0].id;
+  if (data.type === "register") {
+    await register(ws, data);
+    return;
+  }
 
+  if (data.type === "send") {
+    await handleSend(ws, data);
+    return;
+  }
 
-  // Try to deliver immediately.
-  const pushed = sendToNumber(
-    dest,
-    {
-      type: "msg",
-      id: String(id),
-      from: from,
-      to: dest,
-      body: body
+  if (data.type === "ack") {
+    if (data.id != null) {
+      await sql`
+        UPDATE messages
+        SET delivered_at = NOW()
+        WHERE id = ${data.id}
+          AND delivered_at IS NULL
+      `;
     }
-  );
 
+    return;
+  }
 
   console.log(
-    `[send] ${from} -> ${dest} ` +
-    `id=${id} pushed_to=${pushed} socket(s)`
-  );
-
-
-  // Tell sender whether recipient is currently online.
-  send(ws, {
-    type: "sent",
-    cid: cid,
-    id: String(id),
-    online: pushed > 0
-  });
-}
-
-
-// ============================================================
-// ACKNOWLEDGEMENT
-// ============================================================
-
-async function handleAck(ws, payload) {
-
-  if (!ws.zanji) {
-    return;
-  }
-
-  const id = String(
-    payload.id || ""
-  );
-
-  if (!/^\d+$/.test(id)) {
-    return;
-  }
-
-  await sql`
-    UPDATE messages
-    SET delivered_at = NOW()
-    WHERE
-      id = ${id}
-      AND to_number = ${ws.zanji}
-      AND delivered_at IS NULL
-  `;
-
-  console.log(
-    `[ack] ${ws.zanji} id=${id}`
+    `[app] unknown type from socket#${ws.sid}:`,
+    data.type
   );
 }
 
-
-// ============================================================
-// REMOVE SOCKET
-// ============================================================
-
-function detach(ws) {
-
-  if (!ws.zanji) {
-    return;
-  }
-
-  const sockets =
-    online.get(ws.zanji);
-
-  if (!sockets) {
-    return;
-  }
-
-  sockets.delete(ws);
-
-  if (sockets.size === 0) {
-    online.delete(ws.zanji);
-  }
-}
-
-
-// ============================================================
-// WEBSOCKET CONNECTION
-// ============================================================
+// -----------------------------------------------------
+// WebSocket
+// -----------------------------------------------------
 
 wss.on("connection", (ws) => {
-
   ws.sid = nextSocketId++;
-
-  ws.isAlive = true;
+  ws.zanjiNumber = null;
+  ws.zanjiToken = null;
 
   console.log(
     `[conn] socket#${ws.sid} opened`
   );
 
-
-  // Keep connection alive.
-  ws.on("pong", () => {
-    ws.isAlive = true;
-  });
-
-
-  // Initial server message.
-  send(ws, {
-    type: "status",
-    text: "Connected to Zanji server"
-  });
-
-
-  // ----------------------------------------------------------
-  // Incoming messages
-  // ----------------------------------------------------------
-
-  ws.on("message", async (data) => {
-
-    let raw;
-
+  ws.on("message", async (rawData) => {
     try {
-
-      raw = JSON.parse(
-        data.toString()
-      );
-
-    } catch (error) {
+      const raw = JSON.parse(rawData.toString());
 
       console.log(
-        `[frame] socket#${ws.sid} received non-JSON data`
+        `[frame] socket#${ws.sid}`,
+        raw.name || "unknown"
       );
 
-      return;
-    }
+      // -------------------------------------------------
+      // MicroStudio -> server connection notification
+      // -------------------------------------------------
 
-
-    const unpacked = unwrap(raw);
-
-
-    console.log(
-      `[frame] socket#${ws.sid} ` +
-      `${unpacked.kind} ` +
-      `${unpacked.payload
-        ? unpacked.payload.type || ""
-        : ""}`
-    );
-
-
-    // Ignore MicroStudio connection events.
-    if (unpacked.kind !== "message") {
-      return;
-    }
-
-
-    const payload =
-      unpacked.payload || {};
-
-
-    try {
-
-      if (payload.type === "register") {
-
-        await handleRegister(
-          ws,
-          payload
-        );
-
-      } else if (payload.type === "send") {
-
-        await handleSend(
-          ws,
-          payload
-        );
-
-      } else if (payload.type === "ack") {
-
-        await handleAck(
-          ws,
-          payload
-        );
-
-      } else {
-
+      if (raw.name === "mp_client_connection") {
         console.log(
-          `[frame] unknown type ${payload.type}`
+          `[frame] socket#${ws.sid} mp_client_connection`
         );
+
+        return;
       }
 
-    } catch (error) {
+      // -------------------------------------------------
+      // MicroStudio application message
+      // -------------------------------------------------
 
-      console.error(
-        "Handler error:",
-        error
+      if (raw.name === "mp_client_message") {
+        console.log(
+          `[frame] socket#${ws.sid} mp_client_message`
+        );
+
+        await handleApplicationMessage(
+          ws,
+          raw.data
+        );
+
+        return;
+      }
+
+      // -------------------------------------------------
+      // MicroStudio update tick
+      //
+      // The official exported MicroStudio server uses
+      // this to advance serverUpdate().
+      //
+      // Our Node server handles application messages
+      // immediately, so no action is required here.
+      // -------------------------------------------------
+
+      if (raw.name === "mp_update") {
+        return;
+      }
+
+      // -------------------------------------------------
+      // MicroStudio disconnected notification
+      // -------------------------------------------------
+
+      if (raw.name === "mp_client_disconnected") {
+        console.log(
+          `[frame] socket#${ws.sid} mp_client_disconnected`
+        );
+
+        if (ws.zanjiNumber) {
+          removeOnline(
+            ws.zanjiNumber,
+            ws
+          );
+        }
+
+        ws.zanjiNumber = null;
+
+        return;
+      }
+
+      console.log(
+        `[frame] socket#${ws.sid} unknown frame`,
+        raw
       );
 
-      send(ws, {
-        type: "status",
-        text: "Server error."
-      });
+    } catch (error) {
+      console.error(
+        `[frame] socket#${ws.sid} error:`,
+        error
+      );
     }
   });
 
-
-  // ----------------------------------------------------------
-  // Close
-  // ----------------------------------------------------------
-
   ws.on("close", (code, reason) => {
+    const number = ws.zanjiNumber;
 
     console.log(
-      `[close] socket#${ws.sid} ` +
-      `${ws.zanji || "unregistered"} ` +
-      `code=${code} ` +
-      `reason=${reason ? reason.toString() : ""}`
+      `[close] socket#${ws.sid} ${number || "unregistered"} code=${code} reason=${reason || ""}`
     );
 
-    detach(ws);
+    // IMPORTANT:
+    // Only remove THIS socket.
+    //
+    // If a newer socket replaced this one,
+    // it won't accidentally delete the new connection.
+    if (number) {
+      removeOnline(number, ws);
+    }
   });
 
-
-  // ----------------------------------------------------------
-  // Error
-  // ----------------------------------------------------------
-
   ws.on("error", (error) => {
-
     console.error(
-      `[error] socket#${ws.sid}`,
-      error.message
+      `[error] socket#${ws.sid}:`,
+      error
     );
   });
 });
 
+// -----------------------------------------------------
+// Start
+// -----------------------------------------------------
 
-// ============================================================
-// WEBSOCKET HEARTBEAT
-// ============================================================
-
-setInterval(() => {
-
-  for (const ws of wss.clients) {
-
-    if (ws.isAlive === false) {
-
-      console.log(
-        `[heartbeat] terminating socket#${ws.sid}`
-      );
-
-      ws.terminate();
-
-      continue;
-    }
-
-    ws.isAlive = false;
-
-    try {
-      ws.ping();
-    } catch (error) {
-      console.error(
-        "[heartbeat] ping failed:",
-        error.message
-      );
-    }
-  }
-
-}, 25000);
-
-
-// ============================================================
-// START SERVER
-// ============================================================
-
-(async () => {
-
+async function startServer() {
   try {
-
     await setupDatabase();
-
-    const PORT =
-      process.env.PORT || 10000;
 
     server.listen(
       PORT,
       "0.0.0.0",
       () => {
-
         console.log(
           `Zanji server running on port ${PORT}`
         );
 
         console.log(
-          `REPLY_FORMAT=${REPLY_FORMAT}`
+          "MicroStudio protocol: ENABLED"
+        );
+
+        console.log(
+          "Supabase persistence: ENABLED"
         );
       }
     );
 
   } catch (error) {
-
     console.error(
-      "Could not start:",
+      "Could not start server:",
       error
     );
 
     process.exit(1);
   }
+}
 
-})();
+startServer();
