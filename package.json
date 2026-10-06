@@ -1,13 +1,14 @@
 {
-  "name": "zanjii-text-server",
+  "name": "zanji-text-server",
   "version": "1.0.0",
-  "description": "Zanjii texting server",
+  "description": "Zanji texting server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.21.2",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "postgres": "^3.4.7"
   }
 }
