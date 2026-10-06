@@ -1,266 +1,489 @@
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
+const postgres = require("postgres");
+
+
+// ========================================
+// APP / SERVER
+// ========================================
 
 const app = express();
+
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server: server });
 
-// Zanji number -> WebSocket connection
-const users = new Map();
-
-// Messages waiting for users who are temporarily offline
-const pending = new Map();
-
-
-// ------------------------------------
-// HOME PAGE / HEALTH CHECK
-// ------------------------------------
-
-app.get("/", (req, res) => {
-  res.send("Zanji Text Server is online!");
+const wss = new WebSocket.Server({
+  server: server
 });
 
 
-// ------------------------------------
-// SEND DATA TO A CLIENT
-// ------------------------------------
+// ========================================
+// DATABASE
+// ========================================
+
+const DATABASE_URL = process.env.DATABASE_URL;
+
+if (!DATABASE_URL) {
+  console.error("ERROR: DATABASE_URL is missing!");
+  process.exit(1);
+}
+
+const sql = postgres(DATABASE_URL, {
+  ssl: "require",
+  prepare: false,
+  max: 5
+});
+
+
+// ========================================
+// CONNECTED ZANJI USERS
+// ========================================
+
+// Zanji number -> WebSocket
+const users = new Map();
+
+
+// ========================================
+// CREATE DATABASE TABLE
+// ========================================
+
+async function setupDatabase() {
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS messages (
+      id BIGSERIAL PRIMARY KEY,
+      from_number TEXT NOT NULL,
+      to_number TEXT NOT NULL,
+      body TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      delivered_at TIMESTAMPTZ
+    )
+  `;
+
+  console.log("Database ready!");
+
+}
+
+
+// ========================================
+// HOME PAGE
+// ========================================
+
+app.get("/", (req, res) => {
+
+  res.send("Zanji Text Server is online!");
+
+});
+
+
+// ========================================
+// SEND DATA TO CLIENT
+// ========================================
 
 function send(socket, data) {
-  if (socket && socket.readyState === WebSocket.OPEN) {
+
+  if (
+    socket &&
+    socket.readyState === WebSocket.OPEN
+  ) {
+
     socket.send(JSON.stringify(data));
+
   }
+
 }
 
 
-// ------------------------------------
-// SAVE A MESSAGE FOR AN OFFLINE USER
-// ------------------------------------
-
-function queueMessage(number, message) {
-  if (!pending.has(number)) {
-    pending.set(number, []);
-  }
-
-  pending.get(number).push(message);
-}
-
-
-// ------------------------------------
+// ========================================
 // DELIVER SAVED MESSAGES
-// ------------------------------------
+// ========================================
 
-function deliverPending(number, socket) {
-  const messages = pending.get(number);
+async function deliverPending(number, socket) {
 
-  if (!messages || messages.length === 0) {
-    return;
+  try {
+
+    const messages = await sql`
+      SELECT
+        id,
+        from_number,
+        to_number,
+        body,
+        created_at
+      FROM messages
+      WHERE to_number = ${number}
+      AND delivered_at IS NULL
+      ORDER BY id ASC
+    `;
+
+
+    for (const message of messages) {
+
+      send(socket, {
+
+        type: "msg",
+
+        from: message.from_number,
+
+        to: message.to_number,
+
+        body: message.body
+
+      });
+
+
+      // Mark this message as delivered
+
+      await sql`
+        UPDATE messages
+        SET delivered_at = NOW()
+        WHERE id = ${message.id}
+      `;
+
+    }
+
+
+    if (messages.length > 0) {
+
+      console.log(
+        "Delivered " +
+        messages.length +
+        " saved message(s) to " +
+        number
+      );
+
+    }
+
   }
 
-  for (const message of messages) {
-    send(socket, message);
+  catch (error) {
+
+    console.error(
+      "Could not deliver pending messages:",
+      error
+    );
+
   }
 
-  pending.delete(number);
 }
 
 
-// ------------------------------------
-// NEW CONNECTION
-// ------------------------------------
+// ========================================
+// NEW WEBSOCKET CONNECTION
+// ========================================
 
 wss.on("connection", (socket) => {
+
   console.log("Player connected");
+
 
   let number = null;
 
+
+  // Tell client connection worked
+
   send(socket, {
+
     type: "status",
+
     text: "Connected to Zanji server!"
+
   });
 
 
-  // ----------------------------------
+  // ======================================
   // RECEIVE MESSAGE
-  // ----------------------------------
+  // ======================================
 
-  socket.on("message", (data) => {
+  socket.on("message", async (data) => {
 
     try {
 
-      const message = JSON.parse(data.toString());
+      const message =
+        JSON.parse(data.toString());
 
-      console.log("Message received:", message);
+
+      console.log(
+        "Message received:",
+        message
+      );
 
 
-      // ==================================
-      // REGISTER PLAYER
-      // ==================================
+      // ====================================
+      // REGISTER
+      // ====================================
 
       if (message.type === "register") {
 
-        number = String(message.number || "");
+        number =
+          String(message.number || "");
+
 
         if (!number) {
 
           send(socket, {
+
             type: "status",
-            text: "Registration failed: no Zanji number."
+
+            text:
+              "Registration failed: no Zanji number."
+
           });
 
           return;
+
         }
 
 
-        // If this number already has another
-        // connection, close the old one.
+        // If the same number was already
+        // connected, close the old connection.
 
-        const oldSocket = users.get(number);
+        const oldSocket =
+          users.get(number);
 
-        if (oldSocket && oldSocket !== socket) {
+
+        if (
+          oldSocket &&
+          oldSocket !== socket
+        ) {
 
           try {
+
             oldSocket.close();
-          } catch (e) {}
+
+          }
+
+          catch (e) {}
 
         }
 
 
-        // Save this connection
+        // Save current connection
+
         users.set(number, socket);
 
 
-        // Tell the game its number
+        // Tell game its number
+
         send(socket, {
+
           type: "assigned",
+
           number: number
+
         });
 
 
-        // Tell the game it is online
+        // Tell game it is online
+
         send(socket, {
+
           type: "status",
+
           text: "ONLINE"
+
         });
 
 
-        // Send messages that arrived while
-        // the player was disconnected.
+        console.log(
+          "Registered Zanji number:",
+          number
+        );
 
-        deliverPending(number, socket);
 
+        // =================================
+        // DELIVER OLD / OFFLINE MESSAGES
+        // =================================
 
-        console.log("Registered Zanji number:", number);
+        await deliverPending(
+          number,
+          socket
+        );
+
 
         return;
+
       }
 
 
-      // ==================================
-      // SEND ZANJI MESSAGE
-      // ==================================
+      // ====================================
+      // SEND MESSAGE
+      // ====================================
 
       if (message.type === "send") {
 
-        const dest = String(message.dest || "");
-        const body = String(message.body || "");
+        const dest =
+          String(message.dest || "");
 
 
-        // Player hasn't registered yet
+        const body =
+          String(message.body || "");
+
+
+        // Make sure sender is registered
+
         if (!number) {
 
           send(socket, {
+
             type: "status",
+
             text: "Not registered yet."
+
           });
 
           return;
+
         }
 
 
         // Don't allow empty messages
-        if (!dest || !body) {
+
+        if (
+          !dest ||
+          !body
+        ) {
 
           send(socket, {
+
             type: "status",
+
             text: "Message was empty."
+
           });
 
           return;
+
         }
 
 
-        // This is the format Chapter 4 expects.
+        // =================================
+        // SAVE MESSAGE TO DATABASE FIRST
+        // =================================
+
+        const saved =
+          await sql`
+            INSERT INTO messages
+              (
+                from_number,
+                to_number,
+                body
+              )
+            VALUES
+              (
+                ${number},
+                ${dest},
+                ${body}
+              )
+            RETURNING
+              id,
+              created_at
+          `;
+
+
+        const messageId =
+          saved[0].id;
+
+
+        // =================================
+        // CREATE MESSAGE FOR RECIPIENT
+        // =================================
+
         const outgoing = {
+
           type: "msg",
+
           from: number,
+
           to: dest,
+
           body: body
+
         };
 
 
-        // Find the recipient
-        const recipient = users.get(dest);
+        // =================================
+        // CHECK IF RECIPIENT IS ONLINE
+        // =================================
 
+        const recipient =
+          users.get(dest);
 
-        // ==================================
-        // RECIPIENT IS ONLINE
-        // ==================================
 
         if (
           recipient &&
           recipient.readyState === WebSocket.OPEN
         ) {
 
-          // IMPORTANT:
-          // Send ONLY to the person who was targeted.
+          // Send ONLY to intended recipient
 
-          send(recipient, outgoing);
+          send(
+            recipient,
+            outgoing
+          );
 
 
-          // Tell sender the message was delivered
+          // Mark as delivered
+
+          await sql`
+            UPDATE messages
+            SET delivered_at = NOW()
+            WHERE id = ${messageId}
+          `;
+
+
+          // Tell sender
+
           send(socket, {
+
             type: "status",
+
             text: "DELIVERED"
+
           });
 
 
           console.log(
-            number + " -> " + dest + ": delivered"
+            number +
+            " -> " +
+            dest +
+            ": delivered"
           );
 
         }
-
-
-        // ==================================
-        // RECIPIENT IS OFFLINE
-        // ==================================
 
         else {
 
-          // Save it temporarily
-          queueMessage(dest, outgoing);
-
+          // Recipient is offline.
+          // Message stays in database.
 
           send(socket, {
+
             type: "status",
-            text: "SAVED - recipient is offline"
+
+            text:
+              "SAVED - recipient is offline"
+
           });
 
 
           console.log(
-            number + " -> " + dest + ": queued"
+            number +
+            " -> " +
+            dest +
+            ": saved for later"
           );
 
         }
 
+
         return;
+
       }
 
 
-      // ==================================
+      // ====================================
       // UNKNOWN MESSAGE
-      // ==================================
+      // ====================================
 
       console.log(
         "Unknown message type:",
@@ -270,20 +493,20 @@ wss.on("connection", (socket) => {
     }
 
 
-    // ====================================
-    // INVALID JSON
-    // ====================================
-
     catch (error) {
 
-      console.log(
-        "Invalid message:",
+      console.error(
+        "Message error:",
         error
       );
 
+
       send(socket, {
+
         type: "status",
-        text: "Invalid message."
+
+        text: "Server error."
+
       });
 
     }
@@ -291,9 +514,9 @@ wss.on("connection", (socket) => {
   });
 
 
-  // ------------------------------------
-  // PLAYER DISCONNECTED
-  // ------------------------------------
+  // ======================================
+  // DISCONNECT
+  // ======================================
 
   socket.on("close", () => {
 
@@ -302,9 +525,6 @@ wss.on("connection", (socket) => {
       number || "unregistered"
     );
 
-
-    // Only remove the connection if this
-    // is still the active connection.
 
     if (
       number &&
@@ -318,13 +538,13 @@ wss.on("connection", (socket) => {
   });
 
 
-  // ------------------------------------
-  // CONNECTION ERROR
-  // ------------------------------------
+  // ======================================
+  // ERROR
+  // ======================================
 
   socket.on("error", (error) => {
 
-    console.log(
+    console.error(
       "WebSocket error:",
       error
     );
@@ -344,21 +564,48 @@ wss.on("connection", (socket) => {
 });
 
 
-// ------------------------------------
+// ========================================
 // START SERVER
-// ------------------------------------
+// ========================================
 
-// Render provides PORT automatically.
-// 0.0.0.0 allows Render to access it.
+async function startServer() {
 
-const PORT = process.env.PORT || 3000;
+  try {
 
-server.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      "Zanji server running on port " + PORT
+    await setupDatabase();
+
+
+    const PORT =
+      process.env.PORT || 10000;
+
+
+    server.listen(
+      PORT,
+      "0.0.0.0",
+      () => {
+
+        console.log(
+          "Zanji server running on port " +
+          PORT
+        );
+
+      }
     );
+
   }
-);
+
+  catch (error) {
+
+    console.error(
+      "Could not start server:",
+      error
+    );
+
+    process.exit(1);
+
+  }
+
+}
+
+
+startServer();
