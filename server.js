@@ -26,12 +26,17 @@ app.get("/", (req, res) => res.send("Zanji Text Server is online!"));
 app.get("/health", (req, res) => res.json({ ok: true, online: [...online.keys()].length }));
 
 async function setupDatabase() {
-await sqlCREATE TABLE IF NOT EXISTS messages (   id BIGSERIAL PRIMARY KEY,   from_number TEXT NOT NULL,   to_number TEXT NOT NULL,   body TEXT NOT NULL,   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),   delivered_at TIMESTAMPTZ   );
-await sqlALTER TABLE messages ADD COLUMN IF NOT EXISTS client_msg_id TEXT;
-await sqlCREATE UNIQUE INDEX IF NOT EXISTS messages_from_cid_uidx   ON messages (from_number, client_msg_id) WHERE client_msg_id IS NOT NULL;
-await sqlCREATE INDEX IF NOT EXISTS messages_pending_idx   ON messages (to_number, id) WHERE delivered_at IS NULL;
-await sqlCREATE TABLE IF NOT EXISTS zanji_users (   number TEXT PRIMARY KEY,   token TEXT NOT NULL,   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()   );
-console.log("Database ready");
+  await sql`
+    CREATE TABLE IF NOT EXISTS messages (
+      id BIGSERIAL PRIMARY KEY,
+      from_number TEXT NOT NULL,
+      to_number TEXT NOT NULL,
+      body TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      delivered_at TIMESTAMPTZ
+    )
+  `;
+  console.log("Database ready!");
 }
 
 // ---------- sending (format is switchable with REPLY_FORMAT) ----------
