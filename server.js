@@ -1,5 +1,5 @@
 // =====================================================
-// ZANJI TEXT SERVER  (v3 - FIXED FOR MICROSTUDIO)
+// ZANJI TEXT SERVER  (v4 - WITH HANDSHAKE FIX)
 // Render + Supabase (PostgreSQL)
 // =====================================================
 
@@ -13,7 +13,6 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 // microStudio ServerConnection expects:
 //   { name: "mp_server_message", data: { type: "...", ... } }
-// The client looks at  message.data.type  — NOT message.type.
 const WIRE_MODE = (process.env.WIRE_MODE || "envelope").toLowerCase();
 
 if (!DATABASE_URL) {
@@ -81,8 +80,6 @@ async function setupDatabase() {
 // -----------------------------------------------------
 
 function encode(data) {
-  // ALWAYS wrap in the envelope. Even if WIRE_MODE=raw is set,
-  // we still need the envelope for microStudio to parse it.
   return JSON.stringify({ name: "mp_server_message", data });
 }
 
@@ -333,32 +330,25 @@ wss.on("connection", (ws) => {
       const raw = JSON.parse(rawData.toString());
       console.log(`[recv] #${ws.sid}`, JSON.stringify(raw).slice(0, 200));
 
-      // microStudio wraps client messages in an envelope:
-      //   { name: "mp_client_message", data: {...} }
-      // or  { name: "mp_client_connection" } / { name: "mp_update" }
-      let payload = raw;
-
-      if (raw && typeof raw.name === "string") {
-        switch (raw.name) {
-          case "mp_client_connection":
-            console.log(`[frame] #${ws.sid} mp_client_connection`);
-            return;
-          case "mp_client_message":
-            payload = raw.data;
-            break;
-          case "mp_update":
-            return;
-          case "mp_client_disconnected":
-            console.log(`[frame] #${ws.sid} mp_client_disconnected (ignored)`);
-            return;
-          default:
-            console.log(`[frame] #${ws.sid} unknown envelope: ${raw.name}`);
-            payload = raw.data || raw;
-        }
+      // HANDLE MICROSTUDIO HANDSHAKE
+      if (raw && raw.name === "mp_client_connection") {
+        console.log(`[frame] #${ws.sid} mp_client_connection`);
+        // Reply with the handshake response microStudio needs
+        ws.send(JSON.stringify({ name: "mp_server_connection" }));
+        return;
       }
 
-      if (payload && typeof payload.type === "string") {
-        await handleApplicationMessage(ws, payload);
+      if (raw && raw.name === "mp_client_message") {
+        await handleApplicationMessage(ws, raw.data);
+        return;
+      }
+
+      if (raw && raw.name === "mp_update") return;
+      if (raw && raw.name === "mp_client_disconnected") return;
+
+      // Fallback for plain {type:...}
+      if (raw && typeof raw.type === "string") {
+        await handleApplicationMessage(ws, raw);
         return;
       }
 
