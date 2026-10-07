@@ -1,6 +1,5 @@
 // =====================================================
-// ZANJI TEXT SERVER  (v2)
-// MicroStudio external WebSocket server
+// ZANJI TEXT SERVER  (v3 - FIXED FOR MICROSTUDIO)
 // Render + Supabase (PostgreSQL)
 // =====================================================
 
@@ -12,9 +11,9 @@ const postgres = require("postgres");
 const PORT = process.env.PORT || 10000;
 const DATABASE_URL = process.env.DATABASE_URL;
 
-// "envelope" -> {name:"mp_server_message", data:{...}}   (default)
-// "raw"      -> {...}                                     (plain JSON)
-// Switch on Render > Environment > WIRE_MODE if the game shows frames:0
+// microStudio ServerConnection expects:
+//   { name: "mp_server_message", data: { type: "...", ... } }
+// The client looks at  message.data.type  — NOT message.type.
 const WIRE_MODE = (process.env.WIRE_MODE || "envelope").toLowerCase();
 
 if (!DATABASE_URL) {
@@ -32,8 +31,6 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// number -> Set of sockets (several sockets per number are allowed,
-// so two game instances with the same identity never kick each other)
 const online = new Map();
 let nextSocketId = 1;
 
@@ -84,9 +81,9 @@ async function setupDatabase() {
 // -----------------------------------------------------
 
 function encode(data) {
-  return JSON.stringify(
-    WIRE_MODE === "raw" ? data : { name: "mp_server_message", data }
-  );
+  // ALWAYS wrap in the envelope. Even if WIRE_MODE=raw is set,
+  // we still need the envelope for microStudio to parse it.
+  return JSON.stringify({ name: "mp_server_message", data });
 }
 
 function sendTo(ws, data) {
@@ -133,8 +130,6 @@ function randomNumber() {
   return "73" + String(Math.floor(Math.random() * 900000) + 100000);
 }
 
-// Returns the number that belongs to this token (the requested one if the
-// token matches / the number is free, otherwise a brand new one).
 async function claimNumber(requested, token) {
   if (validNumber(requested)) {
     await sql`
@@ -190,9 +185,6 @@ async function register(ws, data) {
 
 // -----------------------------------------------------
 // Pending messages
-// A message is only marked delivered when the client ACKs it,
-// so a dropped connection can never lose a message.
-// The client de-duplicates by id, so re-sending is safe.
 // -----------------------------------------------------
 
 async function deliverPending(number, ws) {
@@ -289,7 +281,6 @@ async function handleSend(ws, data) {
     console.log(`[msg] duplicate cid ${cid} ignored (#${id})`);
   }
 
-  // Tells the sender it is safe to drop the message from its outbox.
   sendTo(ws, {
     type: "sent",
     cid: cid || "",
@@ -340,33 +331,38 @@ wss.on("connection", (ws) => {
     ws.isAlive = true;
     try {
       const raw = JSON.parse(rawData.toString());
+      console.log(`[recv] #${ws.sid}`, JSON.stringify(raw).slice(0, 200));
 
-      switch (raw.name) {
-        case "mp_client_connection":
-          console.log(`[frame] #${ws.sid} mp_client_connection`);
-          return;
+      // microStudio wraps client messages in an envelope:
+      //   { name: "mp_client_message", data: {...} }
+      // or  { name: "mp_client_connection" } / { name: "mp_update" }
+      let payload = raw;
 
-        case "mp_client_message":
-          await handleApplicationMessage(ws, raw.data);
-          return;
-
-        case "mp_update":
-          return;
-
-        case "mp_client_disconnected":
-          // Informational only. The real socket "close" event is what
-          // decides whether someone is offline.
-          console.log(`[frame] #${ws.sid} mp_client_disconnected (ignored)`);
-          return;
+      if (raw && typeof raw.name === "string") {
+        switch (raw.name) {
+          case "mp_client_connection":
+            console.log(`[frame] #${ws.sid} mp_client_connection`);
+            return;
+          case "mp_client_message":
+            payload = raw.data;
+            break;
+          case "mp_update":
+            return;
+          case "mp_client_disconnected":
+            console.log(`[frame] #${ws.sid} mp_client_disconnected (ignored)`);
+            return;
+          default:
+            console.log(`[frame] #${ws.sid} unknown envelope: ${raw.name}`);
+            payload = raw.data || raw;
+        }
       }
 
-      // Tolerate a plain {type:...} frame too
-      if (raw && typeof raw.type === "string") {
-        await handleApplicationMessage(ws, raw);
+      if (payload && typeof payload.type === "string") {
+        await handleApplicationMessage(ws, payload);
         return;
       }
 
-      console.log(`[frame] #${ws.sid} unknown frame:`, raw);
+      console.log(`[frame] #${ws.sid} unhandled:`, raw);
     } catch (err) {
       console.error(`[frame] #${ws.sid} error:`, err);
       sendTo(ws, { type: "status", text: "Server error. Try again." });
@@ -381,7 +377,6 @@ wss.on("connection", (ws) => {
   ws.on("error", (err) => console.error(`[error] #${ws.sid}:`, err.message));
 });
 
-// Reap dead sockets + keep Render's proxy from idling the connection
 const heartbeat = setInterval(() => {
   for (const ws of wss.clients) {
     if (!ws.isAlive) {
