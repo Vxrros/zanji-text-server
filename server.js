@@ -1,5 +1,5 @@
 // =====================================================
-// ZANJI TEXT SERVER  (v4 - WITH HANDSHAKE FIX)
+// ZANJI TEXT SERVER  (v5 - RAW MODE FOR MICROSTUDIO)
 // Render + Supabase (PostgreSQL)
 // =====================================================
 
@@ -11,9 +11,8 @@ const postgres = require("postgres");
 const PORT = process.env.PORT || 10000;
 const DATABASE_URL = process.env.DATABASE_URL;
 
-// microStudio ServerConnection expects:
-//   { name: "mp_server_message", data: { type: "...", ... } }
-const WIRE_MODE = (process.env.WIRE_MODE || "envelope").toLowerCase();
+// Set this to "raw" in Render Environment Variables.
+const WIRE_MODE = (process.env.WIRE_MODE || "raw").toLowerCase();
 
 if (!DATABASE_URL) {
   console.error("ERROR: DATABASE_URL is missing!");
@@ -37,10 +36,6 @@ app.get("/", (req, res) => res.send("Zanji Text Server is online!"));
 app.get("/health", (req, res) =>
   res.json({ ok: true, wire: WIRE_MODE, numbersOnline: online.size })
 );
-
-// -----------------------------------------------------
-// Database
-// -----------------------------------------------------
 
 async function setupDatabase() {
   await sql`
@@ -75,12 +70,9 @@ async function setupDatabase() {
   console.log("Database ready!");
 }
 
-// -----------------------------------------------------
-// Sending
-// -----------------------------------------------------
-
+// Send raw data directly
 function encode(data) {
-  return JSON.stringify({ name: "mp_server_message", data });
+  return JSON.stringify(data);
 }
 
 function sendTo(ws, data) {
@@ -114,10 +106,6 @@ function removeOnline(number, ws) {
   set.delete(ws);
   if (set.size === 0) online.delete(number);
 }
-
-// -----------------------------------------------------
-// Numbers / registration
-// -----------------------------------------------------
 
 function validNumber(n) {
   return /^73\d{6}$/.test(n);
@@ -180,10 +168,6 @@ async function register(ws, data) {
   await deliverPending(number, ws);
 }
 
-// -----------------------------------------------------
-// Pending messages
-// -----------------------------------------------------
-
 async function deliverPending(number, ws) {
   const rows = await sql`
     SELECT id, from_number, to_number, body
@@ -204,10 +188,6 @@ async function deliverPending(number, ws) {
     });
   }
 }
-
-// -----------------------------------------------------
-// Send
-// -----------------------------------------------------
 
 async function handleSend(ws, data) {
   if (!ws.zanjiNumber) {
@@ -311,10 +291,6 @@ async function handleApplicationMessage(ws, data) {
   console.log(`[app] #${ws.sid} unknown type: ${data.type}`);
 }
 
-// -----------------------------------------------------
-// WebSocket
-// -----------------------------------------------------
-
 wss.on("connection", (ws) => {
   ws.sid = nextSocketId++;
   ws.zanjiNumber = null;
@@ -330,10 +306,9 @@ wss.on("connection", (ws) => {
       const raw = JSON.parse(rawData.toString());
       console.log(`[recv] #${ws.sid}`, JSON.stringify(raw).slice(0, 200));
 
-      // HANDLE MICROSTUDIO HANDSHAKE
+      // HANDSHAKE
       if (raw && raw.name === "mp_client_connection") {
         console.log(`[frame] #${ws.sid} mp_client_connection`);
-        // Reply with the handshake response microStudio needs
         ws.send(JSON.stringify({ name: "mp_server_connection" }));
         return;
       }
@@ -367,23 +342,19 @@ wss.on("connection", (ws) => {
   ws.on("error", (err) => console.error(`[error] #${ws.sid}:`, err.message));
 });
 
-const heartbeat = setInterval(() => {
-  for (const ws of wss.clients) {
-    if (!ws.isAlive) {
-      console.log(`[heartbeat] terminating dead socket #${ws.sid}`);
-      ws.terminate();
-      continue;
-    }
-    ws.isAlive = false;
-    try { ws.ping(); } catch (e) {}
-  }
-}, 25000);
-
-wss.on("close", () => clearInterval(heartbeat));
-
-// -----------------------------------------------------
-// Start
-// -----------------------------------------------------
+// --- HEARTBEAT DISABLED FOR NOW ---
+// const heartbeat = setInterval(() => {
+//   for (const ws of wss.clients) {
+//     if (!ws.isAlive) {
+//       console.log(`[heartbeat] terminating dead socket #${ws.sid}`);
+//       ws.terminate();
+//       continue;
+//     }
+//     ws.isAlive = false;
+//     try { ws.ping(); } catch (e) {}
+//   }
+// }, 25000);
+// wss.on("close", () => clearInterval(heartbeat));
 
 async function startServer() {
   try {
